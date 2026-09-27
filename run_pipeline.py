@@ -23,6 +23,7 @@ Requirements:
 
 from __future__ import annotations
 
+import builtins
 import csv
 import gc
 import os
@@ -35,6 +36,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# ── Force flush on EVERY print (Windows buffers stdout) ─────────────────
+_real_print = builtins.print
+def print(*args, **kwargs):
+    kwargs.setdefault("flush", True)
+    _real_print(*args, **kwargs)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION  (edit if needed)
@@ -495,18 +502,19 @@ def _fetch_candidate_details(conn, cand_ids):
     return result
 
 
-def generate_candidates_batch(conn, s1_data):
+def generate_candidates_batch(conn, s1_data, label=""):
     """
     Generate candidate sets for a batch of S1 entities.
 
     Strategy 1: Country-scoped exact blocking (original)
     Strategy 2: Cross-country compact blocking (V2)
-    Strategy 3: Token-overlap blocking (V2)
+    Strategy 3: Token-overlap blocking (V2, SQL-based)
 
     Returns {s1_id: [cand_id, ...]}.
     """
     if not s1_data: return {}
     result = {r["entity_id"]: set() for r in s1_data}
+    t0 = time.time()
 
     # -- Strategy 1: country-scoped exact blocking --------------------
     blocking_cols = ["name_norm","name_translit","name_no_legal","name_compact","name_first_last"]
@@ -597,49 +605,81 @@ def generate_candidates_batch(conn, s1_data):
                             result[sid].add(cid)
                             if len(result[sid]) >= MAX_CANDIDATES_PER_S1: break
 
-    # -- Strategy 3: token-overlap blocking ---------------------------
+    # -- Strategy 3: token-overlap blocking (SQL-based) ----------------
+    #
+    # OLD approach loaded millions of (token, entity_id) pairs into Python
+    # dicts and did nested loops to count overlaps.  ~30M dict ops per
+    # sub-batch → hangs on Windows for minutes/hours.
+    #
+    # NEW approach: build a tiny temp table with this batch's S1 tokens,
+    # then let SQLite's C engine do the JOIN + GROUP BY + HAVING in one
+    # query.  Runs in seconds instead of minutes.
+    #
     try:
         conn.execute("SELECT 1 FROM name_token_index LIMIT 1")
     except Exception:
         pass  # index not built; skip
     else:
-        SUB = 1_000
+        SUB = 200  # smaller sub-batches for memory safety
         for sb_start in range(0, len(s1_data), SUB):
             sb = s1_data[sb_start:sb_start+SUB]
-            s1_toks, all_toks = {}, set()
-            for s1 in sb:
-                sid = s1["entity_id"]
-                if len(result.get(sid, set())) >= MAX_CANDIDATES_PER_S1: continue
-                nn = s1.get("name_norm") or ""
-                if not nn: continue
-                toks = set(t for t in nn.split() if len(t) >= 2)
-                if len(toks) < MIN_TOKEN_OVERLAP: continue
-                s1_toks[sid] = toks
-                all_toks.update(toks)
-            if not all_toks: continue
-            tok2cands = {}
-            for chunk in _chunked(sorted(all_toks), SQL_IN_CHUNK):
-                ph = ",".join("?" for _ in chunk)
-                for tok, cid in conn.execute(
-                    f"SELECT token, entity_id FROM name_token_index WHERE token IN ({ph})", chunk
-                ):
-                    tok2cands.setdefault(tok, []).append(cid)
-            for s1 in sb:
-                sid = s1["entity_id"]
-                toks = s1_toks.get(sid)
-                if not toks: continue
-                if len(result.get(sid, set())) >= MAX_CANDIDATES_PER_S1: continue
-                counts = {}
-                for t in toks:
-                    for cid in tok2cands.get(t, []):
-                        if cid != sid:
-                            counts[cid] = counts.get(cid, 0) + 1
-                bucket = result.setdefault(sid, set())
-                for cid, cnt in sorted(counts.items(), key=lambda x: -x[1]):
-                    if cnt >= MIN_TOKEN_OVERLAP:
-                        bucket.add(cid)
-                        if len(bucket) >= MAX_CANDIDATES_PER_S1: break
 
+            # Build temp table with (s1_id, token) pairs for this sub-batch
+            conn.execute("DROP TABLE IF EXISTS _s1_batch_tokens;")
+            conn.execute(
+                "CREATE TEMP TABLE _s1_batch_tokens "
+                "(s1_id TEXT NOT NULL, token TEXT NOT NULL);"
+            )
+
+            insert_rows = []
+            for s1 in sb:
+                sid = s1["entity_id"]
+                if len(result.get(sid, set())) >= MAX_CANDIDATES_PER_S1:
+                    continue
+                nn = s1.get("name_norm") or ""
+                if not nn:
+                    continue
+                toks = set(t for t in nn.split() if len(t) >= 2)
+                if len(toks) < MIN_TOKEN_OVERLAP:
+                    continue
+                for t in toks:
+                    insert_rows.append((sid, t))
+
+            if not insert_rows:
+                conn.execute("DROP TABLE IF EXISTS _s1_batch_tokens;")
+                continue
+
+            conn.executemany(
+                "INSERT INTO _s1_batch_tokens VALUES (?,?)", insert_rows
+            )
+            # Index the temp table so SQLite picks the right join plan
+            conn.execute(
+                "CREATE INDEX _idx_sbt_token ON _s1_batch_tokens(token);"
+            )
+
+            # One SQL query does ALL the counting in C:
+            #   JOIN on token  →  GROUP BY (s1_id, candidate)  →  HAVING >= 2
+            rows = conn.execute("""
+                SELECT st.s1_id, nti.entity_id, COUNT(*) AS overlap
+                FROM _s1_batch_tokens st
+                JOIN name_token_index nti ON st.token = nti.token
+                GROUP BY st.s1_id, nti.entity_id
+                HAVING overlap >= ?
+                ORDER BY st.s1_id, overlap DESC
+            """, (MIN_TOKEN_OVERLAP,)).fetchall()
+
+            conn.execute("DROP TABLE IF EXISTS _s1_batch_tokens;")
+
+            # Merge results (already sorted by overlap DESC per s1_id)
+            for s1_id, cand_id, _overlap in rows:
+                bucket = result.setdefault(s1_id, set())
+                if len(bucket) < MAX_CANDIDATES_PER_S1:
+                    bucket.add(cand_id)
+
+    elapsed = time.time() - t0
+    total_cands = sum(len(c) for c in result.values())
+    if label:
+        print(f"    [{label}] {len(s1_data):,} S1 -> {total_cands:,} cands  ({elapsed:.1f}s)")
     return {sid: list(cands) for sid, cands in result.items()}
 
 
@@ -677,6 +717,7 @@ def generate_training_data(conn, s1_ids, progress=True, max_s1=None):
     n = len(s1_ids)
 
     for bstart in range(0, n, BATCH_SIZE):
+        batch_t0 = time.time()
         bids = s1_ids[bstart:bstart+BATCH_SIZE]
         s1_data = _fetch_s1_data(conn, bids)
         s1_map = {d["entity_id"]: d for d in s1_data}
@@ -687,7 +728,11 @@ def generate_training_data(conn, s1_ids, progress=True, max_s1=None):
             gt.setdefault(sid, set()).add(cid)
 
         # Batch candidate generation (V2)
-        all_cands = generate_candidates_batch(conn, s1_data)
+        batch_num = bstart // BATCH_SIZE + 1
+        total_batches = (n + BATCH_SIZE - 1) // BATCH_SIZE
+        all_cands = generate_candidates_batch(
+            conn, s1_data, label=f"batch {batch_num}/{total_batches}"
+        )
 
         for sid in bids:
             s1_ent = s1_map.get(sid)
@@ -722,7 +767,9 @@ def generate_training_data(conn, s1_ids, progress=True, max_s1=None):
 
         if progress:
             done = min(bstart + BATCH_SIZE, n)
-            print(f"  {done:,}/{n:,} S1 | pos={n_pos:,}  neg={n_neg:,}  cands={n_cands:,}")
+            batch_elapsed = time.time() - batch_t0
+            print(f"  {done:,}/{n:,} S1 | pos={n_pos:,}  neg={n_neg:,}  "
+                  f"cands={n_cands:,}  ({batch_elapsed:.1f}s)")
 
     X = np.vstack(all_X) if all_X else np.empty((0, NUM_FEATURES), dtype=np.float32)
     y = np.array(all_y, dtype=np.int32)
@@ -926,11 +973,11 @@ def main():
     train_ids, val_ids = get_train_val_split(conn)
     print(f"  Train S1: {len(train_ids):,}  Val S1: {len(val_ids):,}")
 
-    # Measure blocking recall on validation set (sample for speed)
-    print("\n  Measuring blocking recall on val set (sample=5000) ...")
-    val_sample = val_ids[:5000]
+    # Measure blocking recall on a SMALL validation sample first
+    print("\n  Measuring blocking recall on val set (sample=500) ...")
+    val_sample = val_ids[:500]
     val_data = _fetch_s1_data(conn, val_sample)
-    val_cands = generate_candidates_batch(conn, val_data)
+    val_cands = generate_candidates_batch(conn, val_data, label="blocking-recall-sample")
     measure_blocking_recall(conn, val_cands)
     del val_data, val_cands; gc.collect()
 

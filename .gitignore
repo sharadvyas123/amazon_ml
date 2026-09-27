@@ -2,3 +2,4 @@ student_resource/
 __MACOSX/
 venv/
 database/
+__pycache__/
