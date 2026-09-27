@@ -1,284 +1,779 @@
 """
-Efficient candidate generation via multi-strategy blocking.
+Candidate generation for entity resolution.
 
-Uses SQLite indexes to avoid Cartesian products.
-Multiple blocking keys are unioned and deduplicated per S1 entity.
-A hard safety cap prevents pathological bucket explosions.
+IMPORTANT:
+Candidate generation is batch-oriented to avoid executing many SQLite
+queries independently for every S1 entity.
+
+The database contains:
+    source1 ~2.2M rows
+    source2 ~5.0M rows
+    source3 ~5.3M rows
+
+Therefore candidate generation must rely on indexed blocking columns.
 """
+
 import sqlite3
 from typing import Optional
 
-from src.config import MAX_CANDIDATES_PER_S1, SQL_IN_CHUNK, BATCH_SIZE
+from src.config import (
+    MAX_CANDIDATES_PER_S1,
+    MIN_TOKEN_OVERLAP,
+    SQL_IN_CHUNK,
+)
 
 
-def _query_candidates_by_key(
-    conn: sqlite3.Connection,
-    target_table: str,
-    country_norm: str,
-    key_column: str,
-    key_value: str,
-    limit: int = MAX_CANDIDATES_PER_S1,
-) -> list[str]:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _chunked(items, size):
+    """Yield lists of at most `size` items."""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _add_candidates(result, rows):
     """
-    Retrieve candidate entity_ids from target_table where
-    country_norm and key_column match the given values.
+    Add candidate IDs to the result dictionary.
+
+    rows must contain:
+        source1_entity_id, candidate_entity_id
     """
-    if not key_value:
-        return []
-    sql = f"""
-        SELECT entity_id FROM "{target_table}"
-        WHERE country_norm = ? AND "{key_column}" = ?
-        LIMIT ?
-    """
-    return [row[0] for row in conn.execute(sql, (country_norm, key_value, limit)).fetchall()]
+    for s1_id, cand_id in rows:
+        bucket = result.setdefault(s1_id, set())
+
+        # Safety cap.
+        if len(bucket) < MAX_CANDIDATES_PER_S1:
+            bucket.add(cand_id)
 
 
-def _query_candidates_cross_country(
-    conn: sqlite3.Connection,
-    target_table: str,
-    key_column: str,
-    key_value: str,
-    limit: int = 50,
-) -> list[str]:
-    """
-    Cross-country blocking: match on key_column ignoring country.
-    Used sparingly as a fallback to catch cross-country duplicates.
-    """
-    if not key_value:
-        return []
-    sql = f"""
-        SELECT entity_id FROM "{target_table}"
-        WHERE "{key_column}" = ?
-        LIMIT ?
-    """
-    return [row[0] for row in conn.execute(sql, (key_value, limit)).fetchall()]
-
-
-def generate_candidates_for_entity(
-    conn: sqlite3.Connection,
-    s1_id: str,
-    s1_name_norm: str,
-    s1_name_translit: str,
-    s1_name_no_legal: str,
-    s1_name_compact: str,
-    s1_name_first_last: str,
-    s1_addr_norm: str,
-    s1_country_norm: str,
-    cap: int = MAX_CANDIDATES_PER_S1,
-) -> list[str]:
-    """
-    Generate deduplicated candidate IDs from source2 and source3 for one S1 entity.
-
-    Blocking strategies (unioned):
-      1. Exact normalized name match (same country)
-      2. Exact transliterated name match (same country)
-      3. Name without legal suffix match (same country)
-      4. Compact name match (same country) — catches spacing variants
-      5. First+last token match (same country)
-      6. Country + address anchor (same country, exact addr_norm)
-      7. Cross-country transliterated name (no country filter) — small limit
-    """
-    candidates = set()
-
-    for target_table in ["source2", "source3"]:
-        # Strategy 1: exact normalized name
-        candidates.update(_query_candidates_by_key(
-            conn, target_table, s1_country_norm, "name_norm", s1_name_norm, limit=cap
-        ))
-
-        # Strategy 2: transliterated name
-        if s1_name_translit and s1_name_translit != s1_name_norm:
-            candidates.update(_query_candidates_by_key(
-                conn, target_table, s1_country_norm, "name_translit", s1_name_translit, limit=cap
-            ))
-
-        # Strategy 3: name without legal suffix
-        if s1_name_no_legal and s1_name_no_legal != s1_name_norm:
-            candidates.update(_query_candidates_by_key(
-                conn, target_table, s1_country_norm, "name_no_legal", s1_name_no_legal, limit=cap
-            ))
-
-        # Strategy 4: compact name (no spaces)
-        if s1_name_compact:
-            candidates.update(_query_candidates_by_key(
-                conn, target_table, s1_country_norm, "name_compact", s1_name_compact, limit=cap
-            ))
-
-        # Strategy 5: first+last token
-        if s1_name_first_last:
-            candidates.update(_query_candidates_by_key(
-                conn, target_table, s1_country_norm, "name_first_last", s1_name_first_last, limit=cap
-            ))
-
-        # Strategy 6: address blocking (same country + exact address)
-        if s1_addr_norm and len(s1_addr_norm) >= 8:
-            candidates.update(_query_candidates_by_key(
-                conn, target_table, s1_country_norm, "addr_norm", s1_addr_norm, limit=50
-            ))
-
-        # Strategy 7: cross-country transliterated name (small limit)
-        if s1_name_translit:
-            candidates.update(_query_candidates_cross_country(
-                conn, target_table, "name_translit", s1_name_translit, limit=30
-            ))
-
-    # Hard safety cap
-    candidate_list = list(candidates)
-    if len(candidate_list) > cap:
-        candidate_list = candidate_list[:cap]
-
-    return candidate_list
-
-
-def generate_candidates_batch(
-    conn: sqlite3.Connection,
-    s1_entities: list[dict],
-    progress: bool = True,
-) -> dict[str, list[str]]:
-    """
-    Generate candidates for a batch of S1 entities.
-
-    Args:
-        s1_entities: list of dicts with keys:
-            entity_id, name_norm, name_translit, name_no_legal,
-            name_compact, name_first_last, addr_norm, country_norm
-        progress: whether to print progress
-
-    Returns:
-        dict mapping s1_id -> list of candidate entity_ids
-    """
-    results = {}
-    for i, ent in enumerate(s1_entities):
-        candidates = generate_candidates_for_entity(
-            conn,
-            s1_id=ent["entity_id"],
-            s1_name_norm=ent.get("name_norm", ""),
-            s1_name_translit=ent.get("name_translit", ""),
-            s1_name_no_legal=ent.get("name_no_legal", ""),
-            s1_name_compact=ent.get("name_compact", ""),
-            s1_name_first_last=ent.get("name_first_last", ""),
-            s1_addr_norm=ent.get("addr_norm", ""),
-            s1_country_norm=ent.get("country_norm", ""),
-        )
-        results[ent["entity_id"]] = candidates
-
-    return results
-
+# ---------------------------------------------------------------------------
+# S1 blocking data
+# ---------------------------------------------------------------------------
 
 def fetch_s1_blocking_data(
     conn: sqlite3.Connection,
     s1_ids: Optional[list[str]] = None,
     limit: Optional[int] = None,
-    offset: int = 0,
-) -> list[dict]:
+):
     """
-    Fetch S1 entities with all their blocking keys.
-    If s1_ids is given, fetch only those. Otherwise paginate with limit/offset.
+    Fetch only the columns required for blocking.
+
+    If s1_ids is provided, fetch those entities.
+    Otherwise fetch up to `limit` S1 entities.
     """
-    cols = [
-        "entity_id", "business_name", "business_address", "country",
-        "name_norm", "name_translit", "name_no_legal", "name_compact",
-        "name_first_last", "addr_norm", "country_norm",
-    ]
-    col_str = ", ".join(f'"{c}"' for c in cols)
+
+    columns = """
+        entity_id,
+        business_name,
+        business_address,
+        country,
+        country_norm,
+        name_norm,
+        name_translit,
+        name_no_legal,
+        name_compact,
+        addr_norm,
+        name_first_last
+    """
 
     if s1_ids is not None:
-        # Batch fetch by IDs
-        results = []
-        for chunk_start in range(0, len(s1_ids), SQL_IN_CHUNK):
-            chunk = s1_ids[chunk_start:chunk_start + SQL_IN_CHUNK]
-            placeholders = ",".join("?" * len(chunk))
-            sql = f'SELECT {col_str} FROM source1 WHERE entity_id IN ({placeholders})'
-            rows = conn.execute(sql, chunk).fetchall()
-            results.extend(dict(zip(cols, row)) for row in rows)
-        return results
-    else:
-        sql = f'SELECT {col_str} FROM source1'
-        params = []
-        if limit is not None:
-            sql += " LIMIT ? OFFSET ?"
-            params = [limit, offset]
-        rows = conn.execute(sql, params).fetchall()
-        return [dict(zip(cols, row)) for row in rows]
+        if not s1_ids:
+            return []
 
+        result = []
+
+        for chunk in _chunked(s1_ids, SQL_IN_CHUNK):
+            placeholders = ",".join("?" for _ in chunk)
+
+            sql = f"""
+                SELECT {columns}
+                FROM source1
+                WHERE entity_id IN ({placeholders})
+            """
+
+            result.extend(conn.execute(sql, chunk).fetchall())
+
+        col_names = [
+            "entity_id",
+            "business_name",
+            "business_address",
+            "country",
+            "country_norm",
+            "name_norm",
+            "name_translit",
+            "name_no_legal",
+            "name_compact",
+            "addr_norm",
+            "name_first_last",
+        ]
+
+        return [dict(zip(col_names, row)) for row in result]
+
+    sql = f"""
+        SELECT {columns}
+        FROM source1
+        LIMIT ?
+    """
+
+    rows = conn.execute(sql, (limit or 1000,)).fetchall()
+
+    col_names = [
+        "entity_id",
+        "business_name",
+        "business_address",
+        "country",
+        "country_norm",
+        "name_norm",
+        "name_translit",
+        "name_no_legal",
+        "name_compact",
+        "addr_norm",
+        "name_first_last",
+    ]
+
+    return [dict(zip(col_names, row)) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Token-overlap blocking (V2)
+# ---------------------------------------------------------------------------
+
+def _token_overlap_blocking(
+    conn,
+    s1_data,
+    result,
+    min_overlap=MIN_TOKEN_OVERLAP,
+):
+    """
+    Find candidates sharing >= min_overlap name tokens with S1 entities.
+
+    Uses the pre-built ``name_token_index`` table (built by
+    ``database.build_token_index``).  Tokens with very high document
+    frequency were already excluded during index construction.
+
+    This strategy is inherently cross-country because the token index
+    does not store country information.
+
+    Processes S1 entities in sub-batches (1 000 at a time) to keep the
+    in-memory token→candidates mapping at a manageable size.
+    """
+
+    # Check if the token index exists
+    try:
+        conn.execute("SELECT 1 FROM name_token_index LIMIT 1")
+    except Exception:
+        return  # Index not built yet — silently skip
+
+    SUB_BATCH = 1_000
+
+    for sb_start in range(0, len(s1_data), SUB_BATCH):
+        sb = s1_data[sb_start : sb_start + SUB_BATCH]
+
+        # Step 1 — collect tokens from this sub-batch
+        s1_tokens: dict[str, set[str]] = {}
+        all_tokens: set[str] = set()
+
+        for s1 in sb:
+            s1_id = s1["entity_id"]
+
+            if len(result.get(s1_id, set())) >= MAX_CANDIDATES_PER_S1:
+                continue
+
+            name_norm = s1.get("name_norm") or ""
+            if not name_norm:
+                continue
+
+            tokens = set(
+                t for t in name_norm.split() if len(t) >= 2
+            )
+
+            # Only entities with enough tokens can benefit
+            if len(tokens) < min_overlap:
+                continue
+
+            s1_tokens[s1_id] = tokens
+            all_tokens.update(tokens)
+
+        if not all_tokens:
+            continue
+
+        # Step 2 — query the token index in SQL_IN_CHUNK-sized chunks
+        token_to_cands: dict[str, list[str]] = {}
+
+        for chunk in _chunked(sorted(all_tokens), SQL_IN_CHUNK):
+            placeholders = ",".join("?" for _ in chunk)
+
+            rows = conn.execute(
+                f"SELECT token, entity_id "
+                f"FROM name_token_index "
+                f"WHERE token IN ({placeholders})",
+                chunk,
+            ).fetchall()
+
+            for token, cand_id in rows:
+                token_to_cands.setdefault(token, []).append(
+                    cand_id
+                )
+
+        # Step 3 — count overlaps and select candidates
+        for s1 in sb:
+            s1_id = s1["entity_id"]
+            tokens = s1_tokens.get(s1_id)
+
+            if not tokens:
+                continue
+            if len(result.get(s1_id, set())) >= MAX_CANDIDATES_PER_S1:
+                continue
+
+            cand_counts: dict[str, int] = {}
+
+            for token in tokens:
+                for cand_id in token_to_cands.get(token, []):
+                    if cand_id != s1_id:
+                        cand_counts[cand_id] = (
+                            cand_counts.get(cand_id, 0) + 1
+                        )
+
+            # Sort by overlap count (best first)
+            sorted_cands = sorted(
+                cand_counts.items(), key=lambda x: -x[1]
+            )
+
+            bucket = result.setdefault(s1_id, set())
+
+            for cand_id, cnt in sorted_cands:
+                if cnt >= min_overlap:
+                    bucket.add(cand_id)
+                    if len(bucket) >= MAX_CANDIDATES_PER_S1:
+                        break
+
+
+# ---------------------------------------------------------------------------
+# Cross-country compact blocking (V2)
+# ---------------------------------------------------------------------------
+
+def _cross_country_compact_blocking(
+    conn,
+    s1_data,
+    result,
+    min_len=5,
+):
+    """
+    Exact blocking on ``name_compact`` and ``name_no_legal`` WITHOUT
+    the country constraint.
+
+    Catches matches where the country is missing or coded differently
+    between S1 and S2/S3.  Only applies to values with length >= min_len
+    to avoid ambiguous short names generating excessive candidates.
+
+    Requires single-column indexes on name_compact and name_no_legal
+    (created by ``database.ensure_indexes``).
+    """
+
+    blocking_columns = ["name_compact", "name_no_legal"]
+
+    for column in blocking_columns:
+
+        # Collect unique values from this S1 batch
+        values: set[str] = set()
+
+        for s1 in s1_data:
+            val = (s1.get(column) or "").strip()
+            if val and len(val) >= min_len:
+                values.add(val)
+
+        if not values:
+            continue
+
+        for table in ["source2", "source3"]:
+
+            for chunk in _chunked(sorted(values), SQL_IN_CHUNK):
+                placeholders = ",".join("?" for _ in chunk)
+
+                sql = f"""
+                    SELECT entity_id, {column}
+                    FROM {table}
+                    WHERE {column} IN ({placeholders})
+                """
+
+                rows = conn.execute(sql, chunk).fetchall()
+
+                lookup: dict[str, list[str]] = {}
+
+                for entity_id, val in rows:
+                    lookup.setdefault(
+                        val or "", []
+                    ).append(entity_id)
+
+                for s1 in s1_data:
+                    s1_id = s1["entity_id"]
+
+                    if (
+                        len(result.get(s1_id, set()))
+                        >= MAX_CANDIDATES_PER_S1
+                    ):
+                        continue
+
+                    val = (s1.get(column) or "").strip()
+
+                    if not val or len(val) < min_len:
+                        continue
+
+                    bucket = result.setdefault(s1_id, set())
+
+                    for cand_id in lookup.get(val, []):
+                        if cand_id != s1_id:
+                            bucket.add(cand_id)
+                            if len(bucket) >= MAX_CANDIDATES_PER_S1:
+                                break
+
+
+# ---------------------------------------------------------------------------
+# Batch candidate generation
+# ---------------------------------------------------------------------------
+
+def generate_candidates_batch(
+    conn: sqlite3.Connection,
+    s1_data: list[dict],
+    progress: bool = True,
+):
+    """
+    Generate candidates for MANY S1 entities using set-based SQL.
+
+    This is the important performance path.
+
+    Instead of:
+
+        S1 #1 -> SQL
+        S1 #2 -> SQL
+        S1 #3 -> SQL
+        ...
+        S1 #5000 -> SQL
+
+    we use blocking keys from the entire batch and perform indexed queries
+    against source2/source3 in chunks.
+    """
+
+    if not s1_data:
+        return {}
+
+    result = {
+        row["entity_id"]: set()
+        for row in s1_data
+    }
+
+    # ------------------------------------------------------------------
+    # Build blocking keys.
+    # ------------------------------------------------------------------
+
+    blocking_columns = [
+        "country_norm",
+        "name_norm",
+        "name_translit",
+        "name_no_legal",
+        "name_compact",
+        "name_first_last",
+        "addr_norm",
+    ]
+
+    # For every blocking column, collect unique non-empty keys.
+    keys = {
+        column: set()
+        for column in blocking_columns
+    }
+
+    for row in s1_data:
+        for column in blocking_columns:
+            value = row.get(column)
+
+            if value:
+                value = str(value).strip()
+
+                if value:
+                    keys[column].add(
+                        (
+                            row.get("country_norm") or "",
+                            value,
+                        )
+                    )
+
+    # ------------------------------------------------------------------
+    # Query source2/source3 using indexed blocking columns.
+    # ------------------------------------------------------------------
+
+    sources = ["source2", "source3"]
+
+    for table in sources:
+
+        # --------------------------------------------------------------
+        # Exact normalized-name blocking
+        # --------------------------------------------------------------
+
+        for column in [
+            "name_norm",
+            "name_translit",
+            "name_no_legal",
+            "name_compact",
+            "name_first_last",
+        ]:
+
+            pairs = list(keys[column])
+
+            if not pairs:
+                continue
+
+            for chunk in _chunked(pairs, SQL_IN_CHUNK):
+
+                conditions = []
+                params = []
+
+                for country, value in chunk:
+                    conditions.append(
+                        "(country_norm = ? AND "
+                        f"{column} = ?)"
+                    )
+                    params.extend([country, value])
+
+                where_clause = " OR ".join(conditions)
+
+                sql = f"""
+                    SELECT
+                        entity_id,
+                        country_norm,
+                        {column}
+                    FROM {table}
+                    WHERE {where_clause}
+                """
+
+                rows = conn.execute(sql, params).fetchall()
+
+                # Map returned candidates back to S1 entities.
+                lookup = {}
+
+                for entity_id, country, value in rows:
+                    lookup.setdefault(
+                        (country or "", value or ""),
+                        []
+                    ).append(entity_id)
+
+                for s1 in s1_data:
+                    if len(result[s1["entity_id"]]) >= MAX_CANDIDATES_PER_S1:
+                        continue
+
+                    country = s1.get("country_norm") or ""
+                    value = s1.get(column) or ""
+
+                    if not value:
+                        continue
+
+                    for cand_id in lookup.get((country, value), []):
+                        if cand_id != s1["entity_id"]:
+                            result[s1["entity_id"]].add(cand_id)
+
+                            if (
+                                len(result[s1["entity_id"]])
+                                >= MAX_CANDIDATES_PER_S1
+                            ):
+                                break
+
+        # --------------------------------------------------------------
+        # Address blocking
+        # --------------------------------------------------------------
+
+        pairs = list(keys["addr_norm"])
+
+        if pairs:
+
+            for chunk in _chunked(pairs, SQL_IN_CHUNK):
+
+                conditions = []
+                params = []
+
+                for country, value in chunk:
+                    conditions.append(
+                        "(country_norm = ? AND addr_norm = ?)"
+                    )
+                    params.extend([country, value])
+
+                where_clause = " OR ".join(conditions)
+
+                sql = f"""
+                    SELECT
+                        entity_id,
+                        country_norm,
+                        addr_norm
+                    FROM {table}
+                    WHERE {where_clause}
+                """
+
+                rows = conn.execute(sql, params).fetchall()
+
+                lookup = {}
+
+                for entity_id, country, value in rows:
+                    lookup.setdefault(
+                        (country or "", value or ""),
+                        []
+                    ).append(entity_id)
+
+                for s1 in s1_data:
+
+                    s1_id = s1["entity_id"]
+
+                    if len(result[s1_id]) >= MAX_CANDIDATES_PER_S1:
+                        continue
+
+                    country = s1.get("country_norm") or ""
+                    value = s1.get("addr_norm") or ""
+
+                    if not value:
+                        continue
+
+                    for cand_id in lookup.get((country, value), []):
+
+                        if cand_id != s1_id:
+                            result[s1_id].add(cand_id)
+
+                        if (
+                            len(result[s1_id])
+                            >= MAX_CANDIDATES_PER_S1
+                        ):
+                            break
+
+    # ------------------------------------------------------------------
+    # Strategy 2: Cross-country compact blocking [V2]
+    # ------------------------------------------------------------------
+
+    _cross_country_compact_blocking(conn, s1_data, result)
+
+    # ------------------------------------------------------------------
+    # Strategy 3: Token-overlap blocking [V2]
+    # ------------------------------------------------------------------
+
+    _token_overlap_blocking(conn, s1_data, result)
+
+    # ------------------------------------------------------------------
+    # Convert sets to lists.
+    # ------------------------------------------------------------------
+
+    result = {
+        s1_id: list(candidates)
+        for s1_id, candidates in result.items()
+    }
+
+    if progress:
+        n_entities = len(result)
+        total = sum(len(v) for v in result.values())
+
+        nonempty = sum(
+            1 for v in result.values()
+            if v
+        )
+
+        print(
+            f"Candidate generation batch complete: "
+            f"{n_entities:,} S1 entities | "
+            f"{nonempty:,} with candidates | "
+            f"{total:,} candidates"
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Compatibility wrapper
+# ---------------------------------------------------------------------------
+
+def generate_candidates_for_entity(
+    conn: sqlite3.Connection,
+    s1_id: str,
+    s1_name_norm: str = "",
+    s1_name_translit: str = "",
+    s1_name_no_legal: str = "",
+    s1_name_compact: str = "",
+    s1_name_first_last: str = "",
+    s1_addr_norm: str = "",
+    s1_country_norm: str = "",
+):
+    """
+    Compatibility wrapper.
+
+    Used only when one entity genuinely needs candidate generation.
+
+    Training should use generate_candidates_batch() instead.
+    """
+
+    s1 = {
+        "entity_id": s1_id,
+        "name_norm": s1_name_norm,
+        "name_translit": s1_name_translit,
+        "name_no_legal": s1_name_no_legal,
+        "name_compact": s1_name_compact,
+        "name_first_last": s1_name_first_last,
+        "addr_norm": s1_addr_norm,
+        "country_norm": s1_country_norm,
+    }
+
+    result = generate_candidates_batch(
+        conn,
+        [s1],
+        progress=False,
+    )
+
+    return result.get(s1_id, [])
+
+
+# ---------------------------------------------------------------------------
+# Candidate details
+# ---------------------------------------------------------------------------
 
 def fetch_candidate_details(
     conn: sqlite3.Connection,
     candidate_ids: list[str],
-) -> dict[str, dict]:
+):
     """
-    Fetch full details for a list of candidate entity_ids from S2/S3 tables.
-    Returns a dict mapping entity_id -> row dict.
+    Fetch candidate entities from source2/source3 in chunks.
+
+    Avoids one SQL query per candidate.
     """
-    cols = [
-        "entity_id", "business_name", "business_address", "country",
-        "name_norm", "name_translit", "name_no_legal", "name_compact",
-        "addr_norm", "country_norm",
+
+    if not candidate_ids:
+        return {}
+
+    result = {}
+
+    s2_ids = [
+        x for x in candidate_ids
+        if str(x).startswith("S2")
     ]
-    col_str = ", ".join(f'"{c}"' for c in cols)
 
-    results = {}
+    s3_ids = [
+        x for x in candidate_ids
+        if str(x).startswith("S3")
+    ]
 
-    # Split by source
-    s2_ids = [cid for cid in candidate_ids if cid.startswith("S2")]
-    s3_ids = [cid for cid in candidate_ids if cid.startswith("S3")]
+    columns = """
+        entity_id,
+        business_name,
+        business_address,
+        country,
+        country_norm,
+        name_norm,
+        name_translit,
+        name_no_legal,
+        name_compact,
+        addr_norm,
+        name_first_last
+    """
 
-    for table, ids in [("source2", s2_ids), ("source3", s3_ids)]:
-        for chunk_start in range(0, len(ids), SQL_IN_CHUNK):
-            chunk = ids[chunk_start:chunk_start + SQL_IN_CHUNK]
-            placeholders = ",".join("?" * len(chunk))
-            sql = f'SELECT {col_str} FROM "{table}" WHERE entity_id IN ({placeholders})'
+    col_names = [
+        "entity_id",
+        "business_name",
+        "business_address",
+        "country",
+        "country_norm",
+        "name_norm",
+        "name_translit",
+        "name_no_legal",
+        "name_compact",
+        "addr_norm",
+        "name_first_last",
+    ]
+
+    for table, ids in [
+        ("source2", s2_ids),
+        ("source3", s3_ids),
+    ]:
+
+        for chunk in _chunked(ids, SQL_IN_CHUNK):
+
+            placeholders = ",".join("?" for _ in chunk)
+
+            sql = f"""
+                SELECT {columns}
+                FROM {table}
+                WHERE entity_id IN ({placeholders})
+            """
+
             rows = conn.execute(sql, chunk).fetchall()
+
             for row in rows:
-                d = dict(zip(cols, row))
-                results[d["entity_id"]] = d
+                entity = dict(zip(col_names, row))
+                result[entity["entity_id"]] = entity
 
-    return results
+    return result
 
+
+# ---------------------------------------------------------------------------
+# Candidate recall
+# ---------------------------------------------------------------------------
 
 def measure_candidate_recall(
     conn: sqlite3.Connection,
-    candidates_dict: dict[str, list[str]],
+    candidates_dict: dict,
     progress: bool = True,
-) -> dict:
+):
     """
-    Measure how many ground-truth positives are found by the candidate generation.
+    Measure how many ground-truth matches appear in generated candidates.
 
-    Returns dict with:
-      total_positives, found_positives, recall, missed_pairs
+    Uses SQL in batches instead of querying ground truth once per S1.
     """
-    total_positives = 0
-    found_positives = 0
-    missed_pairs = []
 
     s1_ids = list(candidates_dict.keys())
 
-    for chunk_start in range(0, len(s1_ids), SQL_IN_CHUNK):
-        chunk = s1_ids[chunk_start:chunk_start + SQL_IN_CHUNK]
-        placeholders = ",".join("?" * len(chunk))
+    if not s1_ids:
+        return {
+            "recall": 0.0,
+            "total_positive_pairs": 0,
+            "found_positive_pairs": 0,
+        }
+
+    total_positive = 0
+    found_positive = 0
+
+    for chunk in _chunked(s1_ids, SQL_IN_CHUNK):
+
+        placeholders = ",".join("?" for _ in chunk)
+
         sql = f"""
             SELECT source1_entity_id, candidate_entity_id
             FROM ground_truth_pairs
-            WHERE source1_entity_id IN ({placeholders}) AND label = 1
+            WHERE source1_entity_id IN ({placeholders})
         """
-        rows = conn.execute(sql, chunk).fetchall()
-        for s1_id, cand_id in rows:
-            total_positives += 1
-            if cand_id in set(candidates_dict.get(s1_id, [])):
-                found_positives += 1
-            else:
-                missed_pairs.append((s1_id, cand_id))
 
-    recall = found_positives / total_positives if total_positives > 0 else 0.0
+        rows = conn.execute(sql, chunk).fetchall()
+
+        gt = {}
+
+        for s1_id, cand_id in rows:
+            gt.setdefault(s1_id, set()).add(cand_id)
+
+        for s1_id in chunk:
+
+            true_candidates = gt.get(s1_id, set())
+            generated = set(candidates_dict.get(s1_id, []))
+
+            total_positive += len(true_candidates)
+            found_positive += len(
+                true_candidates & generated
+            )
+
+    recall = (
+        found_positive / total_positive
+        if total_positive
+        else 0.0
+    )
 
     if progress:
-        print(f"  Candidate recall: {found_positives:,}/{total_positives:,} = {recall:.4f}")
-        if missed_pairs:
-            print(f"  Missed {len(missed_pairs):,} true positive pairs")
+        print("\n=== Candidate Recall ===")
+        print(f"Ground-truth positives : {total_positive:,}")
+        print(f"Found in candidates     : {found_positive:,}")
+        print(f"Candidate recall        : {recall:.4%}")
 
     return {
-        "total_positives": total_positives,
-        "found_positives": found_positives,
         "recall": recall,
-        "missed_pairs": missed_pairs[:100],  # keep only a sample
+        "total_positive_pairs": total_positive,
+        "found_positive_pairs": found_positive,
     }

@@ -103,6 +103,9 @@ def ensure_indexes(conn: sqlite3.Connection, table: str, progress: bool = True):
         (f"idx_{table}_name_compact",      f'"{table}"(country_norm, name_compact)'),
         (f"idx_{table}_first_last",        f'"{table}"(country_norm, name_first_last)'),
         (f"idx_{table}_country_addr",      f'"{table}"(country_norm, addr_norm)'),
+        # Cross-country indexes (V2: no country_norm prefix)
+        (f"idx_{table}_compact_only",      f'"{table}"(name_compact)'),
+        (f"idx_{table}_no_legal_only",     f'"{table}"(name_no_legal)'),
     ]
 
     existing = {row[0] for row in conn.execute(
@@ -181,6 +184,145 @@ def ensure_ground_truth_pairs(conn: sqlite3.Connection, progress: bool = True):
         print(f"  ground_truth_pairs: {total:,} rows created.")
 
 
+def build_token_index(
+    conn: sqlite3.Connection,
+    max_token_freq: int = 10_000,
+    progress: bool = True,
+):
+    """
+    Build an inverted token index for S2/S3 entities.
+
+    Maps individual name tokens to entity IDs so that token-overlap
+    blocking can find candidates sharing >= N tokens with an S1 entity.
+
+    Tokens appearing in more than `max_token_freq` entities are excluded
+    because they carry almost no discriminating power (e.g. "international",
+    "group", "services").
+
+    This is idempotent: if the index already exists with data, it is
+    skipped.
+    """
+    # Check if already built
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM name_token_index"
+        ).fetchone()[0]
+        if count > 0:
+            if progress:
+                print(
+                    f"  name_token_index: already built "
+                    f"({count:,} rows), skipping."
+                )
+            return
+    except sqlite3.OperationalError:
+        pass  # Table doesn't exist yet
+
+    if progress:
+        print("  Building name_token_index...")
+
+    # ── Pass 1: Count token document frequencies ────────────────────
+    if progress:
+        print("    Pass 1: Counting token frequencies...")
+
+    token_freq: dict[str, int] = {}
+    total_entities = 0
+
+    for table in ["source2", "source3"]:
+        cursor = conn.execute(
+            f"SELECT entity_id, name_norm FROM {table}"
+        )
+        for _entity_id, name_norm in cursor:
+            if not name_norm:
+                continue
+            total_entities += 1
+            tokens = set(
+                t for t in str(name_norm).split() if len(t) >= 2
+            )
+            for t in tokens:
+                token_freq[t] = token_freq.get(t, 0) + 1
+
+    # Keep only tokens with reasonable frequency
+    valid_tokens = {
+        t for t, freq in token_freq.items()
+        if freq <= max_token_freq
+    }
+
+    excluded = len(token_freq) - len(valid_tokens)
+    if progress:
+        print(f"    Entities scanned   : {total_entities:,}")
+        print(f"    Unique tokens      : {len(token_freq):,}")
+        print(
+            f"    Valid (freq ≤ {max_token_freq:,}): "
+            f"{len(valid_tokens):,}"
+        )
+        print(f"    Excluded (too common): {excluded:,}")
+
+    # ── Create table ────────────────────────────────────────────────
+    conn.execute("DROP TABLE IF EXISTS name_token_index;")
+    conn.execute("""
+        CREATE TABLE name_token_index (
+            token     TEXT NOT NULL,
+            entity_id TEXT NOT NULL
+        );
+    """)
+
+    # ── Pass 2: Populate ────────────────────────────────────────────
+    if progress:
+        print("    Pass 2: Populating index...")
+
+    batch: list[tuple[str, str]] = []
+    total_rows = 0
+
+    for table in ["source2", "source3"]:
+        cursor = conn.execute(
+            f"SELECT entity_id, name_norm FROM {table}"
+        )
+        for entity_id, name_norm in cursor:
+            if not name_norm:
+                continue
+            tokens = (
+                set(t for t in str(name_norm).split() if len(t) >= 2)
+                & valid_tokens
+            )
+            for t in tokens:
+                batch.append((t, entity_id))
+
+            if len(batch) >= 100_000:
+                conn.executemany(
+                    "INSERT INTO name_token_index "
+                    "(token, entity_id) VALUES (?, ?)",
+                    batch,
+                )
+                total_rows += len(batch)
+                batch = []
+
+                if progress and total_rows % 5_000_000 == 0:
+                    print(f"      {total_rows:,} rows inserted...")
+
+    if batch:
+        conn.executemany(
+            "INSERT INTO name_token_index "
+            "(token, entity_id) VALUES (?, ?)",
+            batch,
+        )
+        total_rows += len(batch)
+
+    conn.commit()
+
+    # ── Create B-tree index on token column ─────────────────────────
+    if progress:
+        print("    Creating B-tree index on token column...")
+
+    conn.execute(
+        "CREATE INDEX idx_nti_token "
+        "ON name_token_index(token);"
+    )
+    conn.commit()
+
+    if progress:
+        print(f"  name_token_index: {total_rows:,} rows built.")
+
+
 def setup_database(conn: sqlite3.Connection, progress: bool = True):
     """
     One-stop setup: add normalized columns, indexes, and ground truth pairs
@@ -196,6 +338,9 @@ def setup_database(conn: sqlite3.Connection, progress: bool = True):
         ensure_indexes(conn, table, progress=progress)
 
     ensure_ground_truth_pairs(conn, progress=progress)
+
+    # Build token inverted index for token-overlap blocking (V2)
+    build_token_index(conn, progress=progress)
 
     if progress:
         print("\nDatabase setup complete.")

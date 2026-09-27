@@ -15,8 +15,9 @@ from src.config import (
     BATCH_SIZE, SQL_IN_CHUNK,
 )
 from src.candidate_generation import (
-    fetch_s1_blocking_data, generate_candidates_for_entity,
-    fetch_candidate_details, measure_candidate_recall,
+    fetch_s1_blocking_data, generate_candidates_batch,
+    generate_candidates_for_entity, fetch_candidate_details,
+    measure_candidate_recall,
 )
 from src.features import compute_features, NUM_FEATURES, FEATURE_NAMES
 
@@ -123,23 +124,19 @@ def generate_training_data(
         for s1_id, cand_id in gt_positives:
             gt_by_s1.setdefault(s1_id, set()).add(cand_id)
 
+        # Generate candidates for entire batch at once (V2: enables
+        # token-overlap blocking to run efficiently across the batch).
+        all_candidates_batch = generate_candidates_batch(
+            conn, s1_data, progress=False,
+        )
+
         for s1_id in batch_ids:
             s1_ent = s1_lookup.get(s1_id)
             if s1_ent is None:
                 continue
 
-            # Generate candidates
-            candidates = generate_candidates_for_entity(
-                conn,
-                s1_id=s1_ent["entity_id"],
-                s1_name_norm=s1_ent.get("name_norm") or "",
-                s1_name_translit=s1_ent.get("name_translit") or "",
-                s1_name_no_legal=s1_ent.get("name_no_legal") or "",
-                s1_name_compact=s1_ent.get("name_compact") or "",
-                s1_name_first_last=s1_ent.get("name_first_last") or "",
-                s1_addr_norm=s1_ent.get("addr_norm") or "",
-                s1_country_norm=s1_ent.get("country_norm") or "",
-            )
+            # Get candidates from batch generation (V2)
+            candidates = all_candidates_batch.get(s1_id, [])
             total_candidates += len(candidates)
 
             if not candidates:

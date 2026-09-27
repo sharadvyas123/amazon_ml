@@ -31,8 +31,12 @@ RANDOM_STATE = 42
 
 # ── Candidate generation ────────────────────────────────────────────────
 BATCH_SIZE   = 5_000          # S1 entities per candidate-generation batch
-MAX_CANDIDATES_PER_S1 = 200   # hard safety cap on candidates per S1 entity
+MAX_CANDIDATES_PER_S1 = 500   # hard safety cap on candidates per S1 entity
 SQL_IN_CHUNK = 500            # max placeholders per IN(...) clause
+
+# ── Token-overlap blocking (V2) ─────────────────────────────────────────
+MIN_TOKEN_OVERLAP = 2         # min shared tokens to form a candidate pair
+MAX_TOKEN_FREQ    = 10_000    # skip tokens appearing in > this many entities
 
 # ── Training pairs ──────────────────────────────────────────────────────
 NEGATIVE_TO_POSITIVE_RATIO = 2
